@@ -1,0 +1,7 @@
+# Cached game list, compiled stub and generated game folders all live in
+# %LOCALAPPDATA%\DiscordQuestLauncher\, but ignore local copies just in case.
+detectable.json
+index.json
+stub.exe
+games/
+*.exe
