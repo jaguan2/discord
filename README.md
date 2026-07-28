@@ -113,6 +113,19 @@ outright, because launchers generally don't earn quest credit.
 
 Use `-DryRun` to see what it picked before committing 15 minutes to it.
 
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Ran the full duration. |
+| `1` | Game not found, bad input, or the stub was blocked from starting. |
+| `2` | The game registers no Windows executable — this quest can't be faked. |
+| `3` | The stub died early and ran **less than 15 minutes**. Run it again. |
+
+The script reports how long it *actually* ran, not how long you asked for. If
+the stub dies at minute three you get a warning and exit code 3, not a cheerful
+"done". If it dies after minute fifteen it still counts, and it says so.
+
 ## Caveats
 
 - **Discord desktop must be running**, and you must have accepted the quest
@@ -124,8 +137,12 @@ Use `-DryRun` to see what it picked before committing 15 minutes to it.
   `steamapps\common\<installdir>\` folder. If a quest doesn't progress despite
   the process running, that's the likely reason. This script does not fabricate
   Steam manifests.
-- **Games with no `executables` field can't be faked this way** at all. The
-  script tells you when that's the case.
+- **Games with no `executables` field can't be faked this way** at all, and
+  this is the single biggest limitation: **13,355 of 23,799** entries in
+  Discord's list register zero executables. Shift at Midnight is one — Discord
+  detects it purely through its Xbox and Steam SKUs, so there is no process
+  name to impersonate. Roughly half of all quests are immune to this technique.
+  The script exits with code 2 and says so explicitly.
 - **Antivirus may quarantine the stub.** It's an unsigned executable that does
   nothing but sleep, which is a mildly suspicious shape. The script detects an
   immediate exit and says so.

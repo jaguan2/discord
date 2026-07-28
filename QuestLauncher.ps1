@@ -311,10 +311,15 @@ Write-Host "Running for $Minutes minutes. Press Ctrl+C to stop early." -Foregrou
 Write-Host "Check the quest in Discord: User Settings > Gift Inventory." -ForegroundColor DarkGray
 Write-Host ""
 
+$QuestMinutes = 15     # what Discord actually requires; anything past this is margin
+$started      = Get-Date
+$diedEarly    = $false
+
 try {
-    $deadline = (Get-Date).AddMinutes($Minutes)
+    $deadline = $started.AddMinutes($Minutes)
     while ((Get-Date) -lt $deadline) {
         if ($proc.HasExited) {
+            $diedEarly = $true
             Write-Host "`nThe dummy process died unexpectedly." -ForegroundColor Red
             break
         }
@@ -333,6 +338,19 @@ try {
     }
 }
 
+# Report what actually happened, not what was asked for -- a stub that dies at
+# minute 3 must not print the same cheerful line as one that ran the full time.
+$ran = ((Get-Date) - $started).TotalMinutes
 Write-Host ""
-Write-Host "Stopped $relative after $Minutes minutes." -ForegroundColor Green
+if ($diedEarly) {
+    Write-Host ("$relative only ran {0:N1} of the {1} minutes requested." -f $ran, $Minutes) -ForegroundColor Yellow
+    if ($ran -ge $QuestMinutes) {
+        Write-Host "That still clears the $QuestMinutes-minute quest requirement, so it likely counted." -ForegroundColor DarkGray
+    } else {
+        Write-Host "That is under the $QuestMinutes-minute requirement -- run it again." -ForegroundColor Red
+        exit 3
+    }
+} else {
+    Write-Host ("Stopped $relative after {0:N1} minutes." -f $ran) -ForegroundColor Green
+}
 Write-Host "If the quest didn't complete, it may use the stricter Steam check -- see the README." -ForegroundColor DarkGray
