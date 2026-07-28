@@ -28,6 +28,7 @@ minutes.
 | `-Pick <n>` | Choose among multiple matches without being prompted. |
 | `-BaseDir <path>` | Where the fake game folders go. Default `%LOCALAPPDATA%\DiscordQuestLauncher\games`. |
 | `-Keep` | Leave the dummy files on disk afterwards. |
+| `-DryRun` | Show which executable would be impersonated, without running it. |
 | `-Refresh` | Force a re-download of the game list (cached 24h). |
 
 Double-clicking `run.cmd` prompts for a game name, which avoids PowerShell's
@@ -65,22 +66,52 @@ Verified against the live API:
 |---|---|---|
 | Fallout 4 | `fallout4.exe` | no |
 | ARC Raiders | `pioneergame.exe` | no |
-| Where Winds Meet | `wwm.exe` | no |
+| Where Winds Meet | `wwm.exe`, `where winds meet.exe` | no |
+| RuneScape | `runescape.exe` | no |
 | Delta Force | `win64/deltaforceclient-win64-shipping.exe` | **yes** — `Win64\` |
 | Marvel Rivals | `win64/marvel-win64-shipping.exe` | **yes** — `Win64\` |
+| Umamusume: Pretty Derby | `umamusumeprettyderby/umamusumeprettyderby.exe` | **yes** — `umamusumeprettyderby\` |
 
-Only Delta Force and Marvel Rivals actually need the `Win64` folder. Putting
-all of them in one `Win64` directory works because the folder is required by
-some and harmless to the rest.
+Only the bottom three actually need a parent folder. Putting the Reddit set in
+one `Win64` directory works because the folder is required by some and harmless
+to the rest.
+
+### The process needs a window
+
+This is the part that isn't obvious, and it cost a wasted 17-minute run to
+find. A process that merely *exists* under the right name is **not** enough —
+a binary that just sleeps has no `MainWindowHandle`, and Discord ignores it
+completely. No error, no status, nothing.
+
+So the stub opens a real top-level window (minimized, titled with the game
+name) and runs a message loop. That single change took Where Winds Meet from
+"not detected at all" to completing normally.
+
+If a quest ever stalls, check this first:
+
+```powershell
+(Get-Process runescape).MainWindowHandle   # 0 means Discord won't see it
+```
+
+The useful diagnostic is whether Discord shows "Playing *game*" at all. No
+status means detection failed — process shape, exe name, or activity privacy.
+Status but no quest progress means detection worked and the *quest* is applying
+the stricter check below.
 
 ### Picking among several executables
 
-Games list multiple binaries — launchers, test builds, crash handlers. The
-script scores them and prefers the one that means *actually in-game*:
-`shipping` builds rank highest, anything matching `launcher`, `test`,
-`benchmark`, `editor`, `server` or `crash` is pushed down, and entries flagged
-`is_launcher` are skipped outright. Launchers generally don't earn quest
-credit.
+Games list multiple binaries — launchers, test builds, crash handlers, and
+sometimes third-party clients. RuneScape is the awkward case: it registers
+`osbuddy.exe` and `swiftkit-rs.exe` right next to `runescape.exe`.
+
+The script scores candidates and prefers the one that means *actually
+in-game*. Resemblance to the game's own name is weighted highest, since that's
+what separates the official client from a third-party one; `shipping` builds
+rank up; anything matching `launcher`, `test`, `benchmark`, `editor`, `server`
+or `crash` is pushed down; and entries flagged `is_launcher` are skipped
+outright, because launchers generally don't earn quest credit.
+
+Use `-DryRun` to see what it picked before committing 15 minutes to it.
 
 ## Caveats
 

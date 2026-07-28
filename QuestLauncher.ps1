@@ -45,7 +45,10 @@ param(
     [switch]$Refresh,
 
     # Leave the dummy files on disk after exiting.
-    [switch]$Keep
+    [switch]$Keep,
+
+    # Show which executable would be impersonated, without running anything.
+    [switch]$DryRun
 )
 
 $ErrorActionPreference = 'Stop'
@@ -54,7 +57,7 @@ $DetectableUrl = 'https://discord.com/api/v9/applications/detectable'
 $DataDir       = Join-Path $env:LOCALAPPDATA 'DiscordQuestLauncher'
 $RawCache      = Join-Path $DataDir 'detectable.json'
 $IndexCache    = Join-Path $DataDir 'index.json'
-$StubExe       = Join-Path $DataDir 'stub.exe'
+$StubExe       = Join-Path $DataDir 'stub2.exe'
 $CacheMaxAge   = [TimeSpan]::FromHours(24)
 
 if (-not $BaseDir) { $BaseDir = Join-Path $DataDir 'games' }
@@ -86,11 +89,12 @@ function Get-GameIndex {
     }
 
     # Slim 12 MB of metadata down to just what we match on, so later runs
-    # parse in a fraction of a second.
+    # parse in a fraction of a second. Games with no Windows executable are
+    # kept deliberately: over half the list is like that, and silently dropping
+    # them turns "this game can't be faked" into a misleading "game not found".
     $full = Get-Content $RawCache -Raw -Encoding UTF8 | ConvertFrom-Json
     $slim = foreach ($g in $full) {
         $exes = @($g.executables | Where-Object { $_.os -eq 'win32' })
-        if ($exes.Count -eq 0) { continue }
         [pscustomobject]@{
             name        = $g.name
             id          = $g.id
@@ -101,7 +105,8 @@ function Get-GameIndex {
     }
     $slim = @($slim)
     ($slim | ConvertTo-Json -Depth 6 -Compress) | Out-File $IndexCache -Encoding utf8
-    Write-Host "Indexed $($slim.Count) Windows-detectable games." -ForegroundColor DarkGray
+    $runnable = @($slim | Where-Object { $_.executables.Count -gt 0 }).Count
+    Write-Host "Indexed $($slim.Count) games ($runnable with a Windows executable)." -ForegroundColor DarkGray
     return $slim
 }
 
@@ -119,13 +124,29 @@ function Find-Game {
 
 # --- Choosing which executable to impersonate --------------------------------
 
-# Games list several binaries (launchers, test builds, crash handlers). Score
-# them so we pick the one that represents actually being in-game.
+function Get-NameKey {
+    param([string]$Text)
+    return ($Text.ToLowerInvariant() -replace '[^a-z0-9]', '')
+}
+
+# Games list several binaries: launchers, test builds, crash handlers, and
+# sometimes third-party clients (RuneScape lists osbuddy.exe next to
+# runescape.exe). Score them so we pick the one that means actually in-game.
 function Get-ExeScore {
-    param([string]$Name)
+    param([string]$Name, [string]$GameName)
 
     $n = $Name.ToLowerInvariant()
     $score = 0
+
+    # Resemblance to the game's own name is the strongest signal -- it's what
+    # separates the official client from a third-party one.
+    $base = Get-NameKey ([System.IO.Path]::GetFileNameWithoutExtension($n))
+    $game = Get-NameKey $GameName
+    if ($base -and $game) {
+        if ($base -eq $game) { $score += 50 }
+        elseif ($game.Contains($base) -or $base.Contains($game)) { $score += 25 }
+    }
+
     if ($n -match 'shipping')                                  { $score += 30 }
     if ($n -match '/')                                         { $score += 10 }
     if ($n -match 'launcher|bootstrap|updater')                { $score -= 100 }
@@ -140,8 +161,9 @@ function Select-Executable {
     if ($candidates.Count -eq 0) { $candidates = @($GameEntry.executables) }
     if ($candidates.Count -eq 0) { return $null }
 
+    $name = $GameEntry.name
     return ($candidates |
-        Sort-Object -Property @{ Expression = { Get-ExeScore $_.name }; Descending = $true },
+        Sort-Object -Property @{ Expression = { Get-ExeScore $_.name $name }; Descending = $true },
                               @{ Expression = { $_.name.Length } } |
         Select-Object -First 1)
 }
@@ -149,21 +171,36 @@ function Select-Executable {
 
 # --- The dummy executable -----------------------------------------------------
 
-# A ~3.5 KB headless binary that sleeps until killed. Compiled once with the
-# C# compiler that ships with the .NET Framework, present on all Win10/11.
+# A small binary that opens a real top-level window and sits there. The window
+# matters: a process that merely sleeps has no MainWindowHandle, and Discord
+# skips those -- it looks for something that behaves like a running game.
+# Compiled once with the C# compiler that ships with the .NET Framework.
 function Ensure-Stub {
     if (Test-Path $StubExe) { return $StubExe }
 
     Write-Host "Building dummy executable (one time)..." -ForegroundColor Cyan
     $src = @'
-using System.Threading;
+using System;
+using System.Windows.Forms;
+
 public class QuestStub {
-    public static void Main() {
-        Thread.Sleep(Timeout.Infinite);
+    [STAThread]
+    public static void Main(string[] args) {
+        string title = "Game";
+        if (args.Length > 0) { title = args[0]; }
+
+        Form f = new Form();
+        f.Text = title;
+        f.Width = 420;
+        f.Height = 240;
+        f.ShowInTaskbar = true;
+        f.WindowState = FormWindowState.Minimized;
+        Application.Run(f);
     }
 }
 '@
-    Add-Type -TypeDefinition $src -OutputAssembly $StubExe -OutputType WindowsApplication
+    Add-Type -TypeDefinition $src -OutputAssembly $StubExe -OutputType WindowsApplication `
+             -ReferencedAssemblies 'System.Windows.Forms', 'System.Drawing'
     return $StubExe
 }
 
@@ -227,14 +264,23 @@ if ($found.Count -gt 1) {
 
 $exe = Select-Executable -GameEntry $target
 if (-not $exe) {
-    Write-Host "$($target.name) has no Windows executable listed, so it can't be faked this way." -ForegroundColor Red
-    exit 1
+    Write-Host ""
+    Write-Host "$($target.name) registers no Windows executable with Discord." -ForegroundColor Red
+    Write-Host "There is no process name to impersonate, so this quest cannot be" -ForegroundColor DarkGray
+    Write-Host "completed by faking a process. Discord detects it through the store" -ForegroundColor DarkGray
+    Write-Host "it ships on (Steam/Xbox) instead. You'd have to actually install it." -ForegroundColor DarkGray
+    exit 2
 }
 
 # "win64/marvel-win64-shipping.exe" -> folder "win64", file "marvel-win64-shipping.exe"
 $relative = $exe.name -replace '/', '\'
 $fullPath = Join-Path $BaseDir $relative
 $folder   = Split-Path $fullPath -Parent
+
+if ($DryRun) {
+    Write-Host "$($target.name)  ->  $relative" -ForegroundColor Green
+    exit 0
+}
 
 if (-not (Test-Path $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
 Copy-Item (Ensure-Stub) -Destination $fullPath -Force
@@ -248,11 +294,16 @@ if (-not (Get-Process -Name 'Discord*' -ErrorAction SilentlyContinue)) {
     Write-Host "Warning: Discord doesn't appear to be running. Start it, or nothing will be detected." -ForegroundColor Yellow
 }
 
-$proc = Start-Process -FilePath $fullPath -PassThru
-Start-Sleep -Milliseconds 500
+$proc = Start-Process -FilePath $fullPath -ArgumentList "`"$($target.name)`"" -PassThru
+Start-Sleep -Milliseconds 1500
 if ($proc.HasExited) {
     Write-Host "The dummy process exited immediately -- antivirus may have blocked it." -ForegroundColor Red
     exit 1
+}
+
+$proc.Refresh()
+if ($proc.MainWindowHandle -eq 0) {
+    Write-Host "Warning: the process has no window yet; Discord may not pick it up." -ForegroundColor Yellow
 }
 
 Write-Host ""
