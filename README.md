@@ -4,6 +4,26 @@ Completes Discord "play a game" quests by running a tiny do-nothing process
 named after the game, instead of downloading a few hundred gigabytes you'll
 uninstall an hour later.
 
+## Windows app
+
+`dist\DiscordQuestLauncher.exe` is a self-contained WinForms queue app. Search
+Discord's detectable-games list, choose the registered executable, add several
+games, and run them sequentially with the recommended 17-minute duration. The
+app verifies that every dummy process has a real window before continuing and
+remembers previously run games.
+
+Build it using the .NET Framework compiler included with Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build.ps1
+```
+
+The app needs no installation. Its cache, history, and temporary game folders
+live in `%LOCALAPPDATA%\DiscordQuestLauncherUI\`; generated game executables are
+removed after each run.
+
+The PowerShell launcher remains available for command-line use.
+
 ```powershell
 .\QuestLauncher.ps1 "Marvel Rivals"
 ```

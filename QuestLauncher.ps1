@@ -48,7 +48,11 @@ param(
     [switch]$Keep,
 
     # Show which executable would be impersonated, without running anything.
-    [switch]$DryRun
+    [switch]$DryRun,
+
+    # Impersonate a specific registered executable instead of the scored pick.
+    # Useful when one of a game's names is known to work and another isn't.
+    [string]$Executable
 )
 
 $ErrorActionPreference = 'Stop'
@@ -270,6 +274,20 @@ if (-not $exe) {
     Write-Host "completed by faking a process. Discord detects it through the store" -ForegroundColor DarkGray
     Write-Host "it ships on (Steam/Xbox) instead. You'd have to actually install it." -ForegroundColor DarkGray
     exit 2
+}
+
+if ($Executable) {
+    $wanted = ($Executable.ToLowerInvariant() -replace '\\', '/')
+    $exe = @($target.executables | Where-Object {
+        $n = $_.name.ToLowerInvariant()
+        ($n -eq $wanted) -or ([System.IO.Path]::GetFileName($n) -eq [System.IO.Path]::GetFileName($wanted))
+    }) | Select-Object -First 1
+
+    if (-not $exe) {
+        Write-Host "$($target.name) does not register '$Executable'. It registers:" -ForegroundColor Red
+        foreach ($e in $target.executables) { Write-Host "    $($e.name)" }
+        exit 1
+    }
 }
 
 # "win64/marvel-win64-shipping.exe" -> folder "win64", file "marvel-win64-shipping.exe"
