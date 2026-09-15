@@ -6,6 +6,7 @@ using System.Drawing.Drawing2D;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -113,12 +114,139 @@ namespace DiscordQuestLauncher
         }
     }
 
+    internal static class SoftShape
+    {
+        public static GraphicsPath Round(Rectangle bounds, int radius)
+        {
+            var path = new GraphicsPath();
+            int d = Math.Min(radius * 2, Math.Min(bounds.Width, bounds.Height));
+            if (d <= 0) return path;
+            path.AddArc(bounds.Left, bounds.Top, d, d, 180, 90);
+            path.AddArc(bounds.Right - d, bounds.Top, d, d, 270, 90);
+            path.AddArc(bounds.Right - d, bounds.Bottom - d, d, d, 0, 90);
+            path.AddArc(bounds.Left, bounds.Bottom - d, d, d, 90, 90);
+            path.CloseFigure();
+            return path;
+        }
+    }
+
+    // Keep native text selection, keyboard navigation and accessibility. The
+    // viewport clips only the system scrollbar; this host paints its replacement.
+    internal sealed class SmoothScrollHost : Control
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ScrollInfo
+        {
+            public int Size, Mask, Min, Max, Page, Position, TrackPosition;
+        }
+        [DllImport("user32.dll")]
+        private static extern bool GetScrollInfo(IntPtr handle, int bar, ref ScrollInfo info);
+        [DllImport("user32.dll")]
+        private static extern IntPtr SendMessage(IntPtr handle, int message, IntPtr wParam, IntPtr lParam);
+        private readonly Control content;
+        private readonly Panel viewport;
+        private readonly System.Windows.Forms.Timer timer;
+        private Rectangle thumb;
+        private int maximum, position, page, dragOffset;
+        private bool dragging, hovering;
+
+        public SmoothScrollHost(Control content)
+        {
+            this.content = content;
+            Bounds = content.Bounds;
+            Anchor = content.Anchor;
+            BackColor = content.BackColor;
+            TabStop = false;
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer, true);
+            viewport = new Panel { BackColor = BackColor, TabStop = false };
+            Controls.Add(viewport);
+            content.Anchor = AnchorStyles.Top | AnchorStyles.Left;
+            content.Location = Point.Empty;
+            viewport.Controls.Add(content);
+            var list = content as ListBox;
+            if (list != null) list.ScrollAlwaysVisible = true;
+            Resize += delegate { LayoutContent(); };
+            timer = new System.Windows.Forms.Timer { Interval = 40 };
+            timer.Tick += delegate { if (Visible) SyncScroll(); };
+            timer.Start();
+            LayoutContent();
+        }
+        private void LayoutContent()
+        {
+            viewport.Bounds = new Rectangle(4, 4, Math.Max(1, Width - 22), Math.Max(1, Height - 8));
+            content.Size = new Size(viewport.Width + SystemInformation.VerticalScrollBarWidth, viewport.Height);
+            SyncScroll();
+        }
+        private void SyncScroll()
+        {
+            if (!content.IsHandleCreated) return;
+            var info = new ScrollInfo { Size = Marshal.SizeOf(typeof(ScrollInfo)), Mask = 7 };
+            if (!GetScrollInfo(content.Handle, 1, ref info)) return;
+            maximum = Math.Max(0, info.Max - Math.Max(1, info.Page) + 1);
+            page = Math.Max(1, info.Page);
+            position = info.Position;
+            int trackHeight = Math.Max(1, Height - 12);
+            int thumbHeight = Math.Min(trackHeight, Math.Max(28, (int)(trackHeight * (double)page / Math.Max(page, info.Max + 1))));
+            var next = maximum == 0 ? Rectangle.Empty : new Rectangle(Width - 13,
+                6 + (int)((trackHeight - thumbHeight) * (double)position / maximum), 7, thumbHeight);
+            if (thumb != next) { thumb = next; Invalidate(); }
+        }
+        private void ScrollTo(int value)
+        {
+            value = Math.Max(0, Math.Min(maximum, value));
+            var list = content as ListBox;
+            if (list != null) list.TopIndex = value;
+            else SendMessage(content.Handle, 0x00B6, IntPtr.Zero, new IntPtr(value - position)); // EM_LINESCROLL
+            SyncScroll();
+        }
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button != MouseButtons.Left || maximum == 0) return;
+            content.Focus();
+            if (e.Y >= thumb.Top && e.Y < thumb.Bottom)
+            {
+                dragging = true; dragOffset = e.Y - thumb.Top; Capture = true;
+            }
+            else ScrollTo(position + (e.Y < thumb.Top ? -page : page));
+            Invalidate();
+        }
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            hovering = true;
+            if (dragging) ScrollTo((int)Math.Round((e.Y - 6 - dragOffset) * (double)maximum / Math.Max(1, Height - 12 - thumb.Height)));
+            Invalidate();
+        }
+        protected override void OnMouseUp(MouseEventArgs e) { base.OnMouseUp(e); dragging = false; Capture = false; Invalidate(); }
+        protected override void OnMouseCaptureChanged(EventArgs e) { base.OnMouseCaptureChanged(e); if (!Capture) dragging = false; }
+        protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); hovering = false; Invalidate(); }
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            base.OnMouseWheel(e);
+            int lines = SystemInformation.MouseWheelScrollLines;
+            ScrollTo(position - e.Delta / 120 * (lines < 0 ? page : lines));
+        }
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            using (var border = SoftShape.Round(new Rectangle(0, 0, Width - 1, Height - 1), 10))
+            using (var pen = new Pen(Color.FromArgb(235, 228, 217))) e.Graphics.DrawPath(pen, border);
+            if (thumb.IsEmpty) return;
+            using (var path = SoftShape.Round(thumb, 4))
+            using (var brush = new SolidBrush(dragging ? Color.FromArgb(139, 113, 89) : hovering ? Color.FromArgb(173, 149, 123) : Color.FromArgb(205, 190, 170)))
+                e.Graphics.FillPath(brush, path);
+        }
+        protected override void Dispose(bool disposing) { if (disposing) timer.Dispose(); base.Dispose(disposing); }
+    }
+
     internal sealed class WarmListBox : ListBox
     {
         public WarmListBox()
         {
             DrawMode = DrawMode.OwnerDrawFixed;
-            ItemHeight = 28;
+            ItemHeight = 32;
             IntegralHeight = false;
             BorderStyle = BorderStyle.None;
         }
@@ -129,7 +257,11 @@ namespace DiscordQuestLauncher
             bool selected = (e.State & DrawItemState.Selected) != 0;
             Color bg = selected ? Color.FromArgb(241, 231, 214) : BackColor;
             Color fg = Color.FromArgb(46, 39, 33);
-            using (var brush = new SolidBrush(bg)) e.Graphics.FillRectangle(brush, e.Bounds);
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            using (var brush = new SolidBrush(BackColor)) e.Graphics.FillRectangle(brush, e.Bounds);
+            var row = Rectangle.Inflate(e.Bounds, -2, -2);
+            using (var path = SoftShape.Round(row, 8))
+            using (var brush = new SolidBrush(bg)) e.Graphics.FillPath(brush, path);
             var textBounds = new Rectangle(e.Bounds.X + 9, e.Bounds.Y, e.Bounds.Width - 14, e.Bounds.Height);
             TextRenderer.DrawText(e.Graphics, GetItemText(Items[e.Index]), Font, textBounds, fg, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
             if ((e.State & DrawItemState.Focus) != 0) ControlPaint.DrawFocusRectangle(e.Graphics, e.Bounds, fg, bg);
@@ -157,16 +289,18 @@ namespace DiscordQuestLauncher
         {
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             var track = new Rectangle(0, 0, Width - 1, Height - 1);
-            using (var brush = new SolidBrush(Color.FromArgb(232, 217, 190))) e.Graphics.FillRectangle(brush, track);
+            using (var path = SoftShape.Round(track, 6))
+            using (var brush = new SolidBrush(Color.FromArgb(232, 217, 190))) e.Graphics.FillPath(brush, path);
             double fraction = Maximum == Minimum ? 0 : (Value - Minimum) / (double)(Maximum - Minimum);
             var fill = new Rectangle(0, 0, (int)(track.Width * fraction), track.Height);
-            if (fill.Width > 0) using (var brush = new SolidBrush(Color.FromArgb(111, 138, 108))) e.Graphics.FillRectangle(brush, fill);
+            if (fill.Width > 0) using (var path = SoftShape.Round(fill, 6))
+                using (var brush = new SolidBrush(Color.FromArgb(111, 138, 108))) e.Graphics.FillPath(brush, path);
         }
     }
 
     internal sealed class MainForm : Form
     {
-        private static readonly Color CreamPage = Color.FromArgb(254, 236, 193);
+        private static readonly Color CreamPage = Color.FromArgb(248, 243, 233);
         private static readonly Color CreamCard = Color.FromArgb(255, 253, 248);
         private static readonly Color CreamHover = Color.FromArgb(245, 221, 168);
         private static readonly Color CreamBorder = Color.FromArgb(229, 201, 143);
@@ -254,7 +388,7 @@ namespace DiscordQuestLauncher
             addButton.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
             addButton.Click += AddSelectedGame;
             var hint = new Label { Text = "choose the exact Discord executable before adding", AutoSize = true, ForeColor = MutedInk, Location = new Point(10, 316), Anchor = AnchorStyles.Bottom | AnchorStyles.Left };
-            split.Panel1.Controls.AddRange(new Control[] { searchBox, viewBox, refreshButton, gameList, executableBox, addButton, hint });
+            split.Panel1.Controls.AddRange(new Control[] { searchBox, viewBox, refreshButton, new SmoothScrollHost(gameList), executableBox, addButton, hint });
 
             queueList = NewListBox(new Point(10, 11), new Size(483, 260));
             queueList.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
@@ -271,13 +405,14 @@ namespace DiscordQuestLauncher
             stopButton.Enabled = false;
             stopButton.Click += delegate { if (cancellation != null) cancellation.Cancel(); };
             var queueHint = new Label { Text = "your queue always runs sequentially", AutoSize = true, ForeColor = MutedInk, Location = new Point(10, 316), Anchor = AnchorStyles.Bottom | AnchorStyles.Left };
-            split.Panel2.Controls.AddRange(new Control[] { queueList, removeButton, minutesLabel, minutesBox, startButton, stopButton, queueHint });
+            split.Panel2.Controls.AddRange(new Control[] { new SmoothScrollHost(queueList), removeButton, minutesLabel, minutesBox, startButton, stopButton, queueHint });
 
             statusLabel = new Label { Text = "Loading Discord game list...", AutoSize = false, Location = new Point(18, 442), Size = new Size(998, 24), Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right };
             statusLabel.ForeColor = Espresso;
             progress = new WarmProgressBar { Location = new Point(18, 469), Size = new Size(998, 12), Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right, Minimum = 0, Maximum = 1000 };
             logBox = new TextBox { Location = new Point(18, 496), Size = new Size(998, 135), Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical, BackColor = CreamCard, ForeColor = MutedInk, BorderStyle = BorderStyle.FixedSingle };
-            Controls.AddRange(new Control[] { statusLabel, progress, logBox });
+            logBox.BorderStyle = BorderStyle.None;
+            Controls.AddRange(new Control[] { statusLabel, progress, new SmoothScrollHost(logBox) });
         }
 
         private Button NewButton(string text, Point location, int width, bool primary)
@@ -396,11 +531,25 @@ namespace DiscordQuestLauncher
             return new string(text.ToLowerInvariant().Where(char.IsLetterOrDigit).ToArray());
         }
 
+        private static string CatalogFileName(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return "";
+            int slash = Math.Max(path.LastIndexOf('/'), path.LastIndexOf('\\'));
+            return slash >= 0 ? path.Substring(slash + 1) : path;
+        }
+
+        private static string CatalogFileNameWithoutExtension(string path)
+        {
+            string fileName = CatalogFileName(path);
+            int dot = fileName.LastIndexOf('.');
+            return dot > 0 ? fileName.Substring(0, dot) : fileName;
+        }
+
         private static int ScoreExecutable(ExecutableEntry executable, string gameName)
         {
             string n = executable.Name.ToLowerInvariant();
             int score = 0;
-            string baseName = NameKey(Path.GetFileNameWithoutExtension(n));
+            string baseName = NameKey(CatalogFileNameWithoutExtension(n));
             string game = NameKey(gameName);
             if (baseName.Length > 0 && game.Length > 0)
             {
@@ -444,6 +593,15 @@ namespace DiscordQuestLauncher
             if (!Process.GetProcessesByName("Discord").Any() && !Process.GetProcesses().Any(p => p.ProcessName.StartsWith("Discord", StringComparison.OrdinalIgnoreCase)))
             {
                 if (MessageBox.Show(this, "Discord does not appear to be running. Continue anyway?", "Discord not found", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+            }
+            var competingGames = FindCompetingGames();
+            if (competingGames.Count > 0)
+            {
+                string message = "Discord may keep another game as its visible activity instead of the queued quest:\r\n\r\n" +
+                    string.Join("\r\n", competingGames.Select(x => "• " + x).ToArray()) +
+                    "\r\n\r\nClose it completely before starting. Continue anyway?";
+                Log("Preflight found another detected game: " + string.Join(", ", competingGames.ToArray()));
+                if (MessageBox.Show(this, message, "Another game is already running", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
             }
             running = true;
             cancellation = new CancellationTokenSource();
@@ -496,6 +654,7 @@ namespace DiscordQuestLauncher
             File.Copy(Application.ExecutablePath, target, true);
             Process process = null;
             var started = DateTime.Now;
+            long discordLogOffset = GetDiscordLogPosition();
             try
             {
                 process = Process.Start(new ProcessStartInfo
@@ -514,6 +673,22 @@ namespace DiscordQuestLauncher
                 if (process.HasExited) throw new InvalidOperationException(item.Game.Name + " exited immediately; antivirus may have blocked it.");
                 if (process.MainWindowHandle == IntPtr.Zero) throw new InvalidOperationException(item.Game.Name + " has no window, so Discord will ignore it.");
                 Log("Verified window handle " + process.MainWindowHandle + " for " + item.Game.Name + ".");
+                string visibleGame = null;
+                for (int attempt = 0; attempt < 5 && visibleGame == null; attempt++)
+                {
+                    visibleGame = ReadDiscordVisibleGame(discordLogOffset);
+                    if (visibleGame == null) await DelayWithCancellation(2000, token);
+                }
+                if (visibleGame != null)
+                {
+                    if (!string.Equals(visibleGame, item.Game.Name, StringComparison.OrdinalIgnoreCase))
+                        throw new InvalidOperationException("Discord kept '" + visibleGame + "' as the visible game instead of '" + item.Game.Name + "'. Close the competing game and retry.");
+                    Log("Discord confirmed visibleGame=" + visibleGame + ".");
+                }
+                else
+                {
+                    Log("Discord activity log did not expose visibleGame; continuing because the process window is valid.");
+                }
                 var duration = TimeSpan.FromMinutes(minutes);
                 while (DateTime.Now - started < duration)
                 {
@@ -547,6 +722,97 @@ namespace DiscordQuestLauncher
         private static Task DelayWithCancellation(int milliseconds, CancellationToken token)
         {
             return Task.Delay(milliseconds, token);
+        }
+
+        private List<string> FindCompetingGames()
+        {
+            var byFileName = new Dictionary<string, List<Tuple<GameEntry, ExecutableEntry>>>(StringComparer.OrdinalIgnoreCase);
+            foreach (var game in allGames)
+            {
+                foreach (var executable in game.Executables)
+                {
+                    string fileName = CatalogFileName(executable.Name);
+                    if (fileName.Length == 0) continue;
+                    List<Tuple<GameEntry, ExecutableEntry>> registrations;
+                    if (!byFileName.TryGetValue(fileName, out registrations))
+                    {
+                        registrations = new List<Tuple<GameEntry, ExecutableEntry>>();
+                        byFileName[fileName] = registrations;
+                    }
+                    registrations.Add(Tuple.Create(game, executable));
+                }
+            }
+
+            var found = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var candidate in Process.GetProcesses())
+            {
+                try
+                {
+                    if (candidate.Id == Process.GetCurrentProcess().Id || candidate.MainWindowHandle == IntPtr.Zero) continue;
+                    string fileName = candidate.ProcessName + ".exe";
+                    List<Tuple<GameEntry, ExecutableEntry>> registrations;
+                    if (!byFileName.TryGetValue(fileName, out registrations)) continue;
+                    string fullPath = null;
+                    try { fullPath = candidate.MainModule.FileName; } catch { }
+                    foreach (var registration in registrations)
+                    {
+                        string expected = registration.Item2.Name.Replace('/', Path.DirectorySeparatorChar);
+                        if (expected.IndexOf(Path.DirectorySeparatorChar) >= 0 &&
+                            (fullPath == null || !fullPath.EndsWith(expected, StringComparison.OrdinalIgnoreCase))) continue;
+                        if (fullPath != null && fullPath.StartsWith(gamesDir + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) continue;
+                        found.Add(registration.Item1.Name + " (" + candidate.ProcessName + ")");
+                    }
+                }
+                catch { }
+                finally { candidate.Dispose(); }
+            }
+            return found.OrderBy(x => x).Take(8).ToList();
+        }
+
+        private static string DiscordLogPath()
+        {
+            return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "discord", "logs", "renderer_js.log");
+        }
+
+        private static long GetDiscordLogPosition()
+        {
+            try
+            {
+                string path = DiscordLogPath();
+                return File.Exists(path) ? new FileInfo(path).Length : 0;
+            }
+            catch { return 0; }
+        }
+
+        private static string ReadDiscordVisibleGame(long offset)
+        {
+            try
+            {
+                string path = DiscordLogPath();
+                if (!File.Exists(path)) return null;
+                using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                {
+                    if (offset > stream.Length) offset = 0;
+                    stream.Seek(offset, SeekOrigin.Begin);
+                    using (var reader = new StreamReader(stream, Encoding.UTF8, true))
+                    {
+                        string last = null;
+                        string line;
+                        while ((line = reader.ReadLine()) != null)
+                        {
+                            int start = line.IndexOf("visibleGame=", StringComparison.Ordinal);
+                            if (start < 0) continue;
+                            start += "visibleGame=".Length;
+                            int end = line.IndexOf(" newPrimaryKey=", start, StringComparison.Ordinal);
+                            if (end < 0) end = line.Length;
+                            string value = line.Substring(start, end - start).Trim();
+                            last = string.Equals(value, "null", StringComparison.OrdinalIgnoreCase) ? null : value;
+                        }
+                        return last;
+                    }
+                }
+            }
+            catch { return null; }
         }
 
         private void LoadHistory()

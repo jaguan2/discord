@@ -10,7 +10,10 @@ uninstall an hour later.
 Discord's detectable-games list, choose the registered executable, add several
 games, and run them sequentially with the recommended 17-minute duration. The
 app verifies that every dummy process has a real window before continuing and
-remembers previously run games.
+remembers previously run games. Before starting, it warns if another registered
+game already has a window and may occupy Discord's activity slot. After launch,
+it reads Discord's local activity log when available to confirm the queued title
+became the visible game.
 
 Build it using the .NET Framework compiler included with Windows:
 
